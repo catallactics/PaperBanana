@@ -17,6 +17,8 @@ Vanilla Agent - Directly rendering images based on the method section.
 """
 
 import json
+import re
+import time
 from typing import Dict, Any
 from google.genai import types
 import base64, io, asyncio
@@ -33,10 +35,13 @@ class CriticAgent(BaseAgent):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
         self.model_name = self.exp_config.main_model_name
+        self.agentic_critic = getattr(self.exp_config, "agentic_critic", False)
 
         # Task-specific configurations
         if self.exp_config.task_name == "plot":
             self.system_prompt = PLOT_CRITIC_AGENT_SYSTEM_PROMPT
+            if self.agentic_critic:
+                self.system_prompt = PLOT_CRITIC_AGENT_SYSTEM_PROMPT + AGENTIC_VISION_PROMPT_SUPPLEMENT
             self.task_config = {
                 "task_name": "plot",
                 "critique_target": "Target Plot for Critique:",
@@ -44,11 +49,16 @@ class CriticAgent(BaseAgent):
             }
         else:
             self.system_prompt = DIAGRAM_CRITIC_AGENT_SYSTEM_PROMPT
+            if self.agentic_critic:
+                self.system_prompt = DIAGRAM_CRITIC_AGENT_SYSTEM_PROMPT + AGENTIC_VISION_PROMPT_SUPPLEMENT
             self.task_config = {
                 "task_name": "diagram",
                 "critique_target": "Target Diagram for Critique:",
                 "context_labels": ["Methodology Section", "Figure Caption"],
             }
+
+        if self.agentic_critic:
+            print("🔬 [Critic] Agentic Vision mode ENABLED (code_execution active)")
 
     async def process(self, data: Dict[str, Any], source: str = "stylist") -> Dict[str, Any]:
         """
@@ -113,19 +123,41 @@ class CriticAgent(BaseAgent):
             "text": f"Detailed Description: {detailed_description}\n{cfg['context_labels'][0]}: {content}\n{cfg['context_labels'][1]}: {visual_intent}\nYour Output:",
         })
 
-        response_list = await generation_utils.call_model_with_retry_async(
-            model_name=self.model_name,
-            contents=content_list,
-            config=types.GenerateContentConfig(
-                system_instruction=self.system_prompt,
-                temperature=self.exp_config.temperature,
-                candidate_count=1,
-                max_output_tokens=50000,
-            ),
-            max_attempts=5,
-            retry_delay=5,
+        # Build config — add code_execution tool if agentic mode is on
+        gen_config_kwargs = dict(
+            system_instruction=self.system_prompt,
+            temperature=self.exp_config.temperature,
+            candidate_count=1,
+            max_output_tokens=50000,
         )
-        
+
+        if self.agentic_critic:
+            # code_execution is incompatible with response_mime_type="application/json"
+            # so we omit JSON mode and extract JSON from text via regex fallback
+            gen_config_kwargs["tools"] = [types.Tool(code_execution=types.ToolCodeExecution())]
+
+        start_time = time.time()
+
+        if self.agentic_critic:
+            # Use raw Gemini call to handle multi-part response with code_execution
+            response_list = await generation_utils.call_gemini_agentic_async(
+                model_name=self.model_name,
+                contents=content_list,
+                config=types.GenerateContentConfig(**gen_config_kwargs),
+                max_attempts=5,
+                retry_delay=5,
+            )
+        else:
+            response_list = await generation_utils.call_model_with_retry_async(
+                model_name=self.model_name,
+                contents=content_list,
+                config=types.GenerateContentConfig(**gen_config_kwargs),
+                max_attempts=5,
+                retry_delay=5,
+            )
+
+        elapsed = time.time() - start_time
+
         cleaned_response = (
             response_list[0].replace("```json", "").replace("```", "").strip()
         )
@@ -139,15 +171,64 @@ class CriticAgent(BaseAgent):
 
         critic_suggestions = eval_result.get("critic_suggestions", "No changes needed.")
         revised_description = eval_result.get("revised_description", "No changes needed.")
-        
+
         data[f"target_{task_name}_critic_suggestions{round_idx}"] = critic_suggestions
         data[f"target_{task_name}_critic_desc{round_idx}"] = revised_description
 
         if revised_description.strip() == "No changes needed.":
             data[f"target_{task_name}_critic_desc{round_idx}"] = detailed_description
 
+        # Log agentic critic metrics
+        if self.agentic_critic:
+            code_execution_log = response_list[1] if len(response_list) > 1 else ""
+            data[f"target_{task_name}_critic_code_exec{round_idx}"] = code_execution_log
+            data[f"target_{task_name}_critic_elapsed{round_idx}"] = round(elapsed, 2)
+            print(f"🔬 [Critic Round {round_idx}] Agentic Vision completed in {elapsed:.1f}s")
+
         return data
 
+
+AGENTIC_VISION_PROMPT_SUPPLEMENT = """
+
+## STRUCTURAL VERIFICATION (Code Execution)
+
+You have Python code execution capability. Before writing your critique, you MUST run Python code to analyze the diagram/plot image structurally. This is your highest-priority analysis step.
+
+### Required Analysis Steps
+
+1. **Load and preprocess the image** using PIL (available in sandbox):
+   ```python
+   from PIL import Image
+   import io, base64
+   # The image is provided as input — use it directly
+   ```
+
+2. **Detect bounded regions** (boxes, circles) by:
+   - Converting to grayscale
+   - Applying simple thresholding to find distinct regions
+   - Counting connected components as approximate node count
+
+3. **Analyze edge/arrow density** by:
+   - Detecting thin dark lines (potential arrows/connections)
+   - Estimating the number of connection paths
+
+4. **Compare structural counts** against the methodology description:
+   - Expected number of major components/nodes
+   - Expected number of connections/arrows
+   - Flag any mismatch as a structural error
+
+5. **Check for common structural errors**:
+   - Dangling arrows (lines that start/end in empty space)
+   - Overlapping text regions
+   - Asymmetric layouts that don't match described architecture
+
+### Important Constraints
+- Only PIL is available (no OpenCV, no scikit-image)
+- Use basic pixel analysis: thresholding, color histograms, region counting
+- Keep analysis simple and robust — approximate counts are valuable
+- Include your code execution results as evidence in `critic_suggestions`
+- **Structural errors (wrong connections, missing nodes) = HIGHEST priority**, above aesthetic issues
+"""
 
 DIAGRAM_CRITIC_AGENT_SYSTEM_PROMPT = """
 ## ROLE

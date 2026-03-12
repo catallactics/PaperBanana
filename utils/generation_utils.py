@@ -51,7 +51,7 @@ def get_config_val(section, key, env_var, default=""):
     return val or default
 
 # Initialize clients lazily or with robust defaults
-api_key = get_config_val("api_keys", "google_api_key", "GOOGLE_API_KEY", "")
+api_key = get_config_val("api_keys", "google_api_key", "GOOGLE_API_KEY", "") or os.getenv("GEMINI_API_KEY", "")
 if api_key:
     gemini_client = genai.Client(api_key=api_key)
     print("Initialized Gemini Client with API Key")
@@ -201,6 +201,76 @@ async def call_gemini_with_retry_async(
     if len(result_list) < target_candidate_count:
         result_list.extend(["Error"] * (target_candidate_count - len(result_list)))
     return result_list
+
+async def call_gemini_agentic_async(
+    model_name, contents, config, max_attempts=5, retry_delay=5, error_context=""
+):
+    """
+    ASYNC: Call Gemini API with code_execution tool enabled.
+    Handles multi-part responses containing executable_code and code_execution_result parts.
+    Returns [text_response, code_execution_log] where code_execution_log captures all code/results.
+    """
+    if gemini_client is None:
+        raise RuntimeError(
+            "Gemini client was not initialized: missing Google API key."
+        )
+
+    for attempt in range(max_attempts):
+        try:
+            client = gemini_client
+            gemini_contents = _convert_to_gemini_parts(contents)
+            response = await client.aio.models.generate_content(
+                model=model_name, contents=gemini_contents, config=config
+            )
+
+            if not response.candidates or not response.candidates[0].content.parts:
+                print(f"[Warning]: Empty agentic response, retrying in {retry_delay}s...")
+                await asyncio.sleep(retry_delay)
+                continue
+
+            # Separate text parts from code execution parts
+            text_parts = []
+            code_log_parts = []
+
+            for part in response.candidates[0].content.parts:
+                if hasattr(part, "executable_code") and part.executable_code:
+                    code_log_parts.append(f"```python\n{part.executable_code.code}\n```")
+                elif hasattr(part, "code_execution_result") and part.code_execution_result:
+                    outcome = part.code_execution_result.outcome
+                    output = part.code_execution_result.output or ""
+                    code_log_parts.append(f"[Execution {outcome}]\n{output}")
+                elif hasattr(part, "text") and part.text:
+                    text_parts.append(part.text)
+
+            text_response = "\n".join(text_parts) if text_parts else ""
+            code_log = "\n---\n".join(code_log_parts) if code_log_parts else ""
+
+            if code_log:
+                print(f"🔬 [Agentic] Code execution detected ({len(code_log_parts)} parts)")
+
+            # Log usage metadata if available
+            if hasattr(response, "usage_metadata") and response.usage_metadata:
+                um = response.usage_metadata
+                print(f"📊 [Agentic] Tokens — prompt: {um.prompt_token_count}, "
+                      f"candidates: {um.candidates_token_count}, total: {um.total_token_count}")
+
+            return [text_response, code_log]
+
+        except Exception as e:
+            context_msg = f" for {error_context}" if error_context else ""
+            current_delay = min(retry_delay * (2 ** attempt), 30)
+            print(
+                f"Agentic attempt {attempt + 1} for {model_name} failed{context_msg}: {e}. "
+                f"Retrying in {current_delay}s..."
+            )
+            if attempt < max_attempts - 1:
+                await asyncio.sleep(current_delay)
+            else:
+                print(f"Error: All {max_attempts} agentic attempts failed{context_msg}")
+                return ["Error", ""]
+
+    return ["Error", ""]
+
 
 def _convert_to_claude_format(contents: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     """

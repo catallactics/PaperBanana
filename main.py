@@ -82,6 +82,12 @@ async def main():
         default="",
         help="main model name to use (default: "")",
     )
+    parser.add_argument(
+        "--agentic-critic",
+        action="store_true",
+        default=False,
+        help="Enable Agentic Vision critic with Gemini code_execution for structural verification",
+    )
     args = parser.parse_args()
 
     exp_config = config.ExpConfig(
@@ -92,6 +98,7 @@ async def main():
         retrieval_setting=args.retrieval_setting,
         max_critic_rounds=args.max_critic_rounds,
         main_model_name=args.main_model_name,
+        agentic_critic=args.agentic_critic,
         work_dir=Path(__file__).parent,
     )
     
