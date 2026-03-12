@@ -80,8 +80,10 @@ class PaperVizProcessor:
             
             critic_suggestions_key = f"target_{task_name}_critic_suggestions{round_idx}"
             critic_suggestions = data.get(critic_suggestions_key, "")
-            
-            if critic_suggestions.strip() == "No changes needed.":
+            if isinstance(critic_suggestions, list):
+                critic_suggestions = " ".join(str(s) for s in critic_suggestions)
+
+            if str(critic_suggestions).strip() == "No changes needed.":
                 print(f"[Critic Round {round_idx}] No changes needed. Stopping iteration.")
                 break
             
